@@ -2,7 +2,7 @@
 
 USER_NAME="${SSH_USER:-ddfathu}"
 USER_PASS="${SSH_PASSWORD:-123456}"
-MAIN_PORT="${PORT:-8080}" # Port utama tunggal dari Railway
+MAIN_PORT="${PORT:-8080}"
 
 echo "[*] Mengonfigurasi User SSH..."
 if ! id "$USER_NAME" &>/dev/null; then
@@ -21,16 +21,19 @@ import threading
 
 def handle_client(client_socket):
     try:
-        # Baca data awal setelah TLS dibuka oleh Stunnel
+        # Baca data awal (payload)
         request = client_socket.recv(1024).decode('utf-8', errors='ignore')
         
-        # Jika ada unsur payload HTTP WebSocket, beri respons balik 101
+        # Jika HTTP Custom mengirimkan payload WebSocket, berikan respon HTTP 101 standar sekali saja
         if "GET " in request or "Upgrade: websocket" in request:
             client_socket.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
         
-        # Teruskan sisanya langsung ke OpenSSH lokal port 22
+        # Langsung sambungkan ke OpenSSH lokal port 22
         ssh_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         ssh_socket.connect(('127.0.0.1', 22))
+
+        # Jika ada sisa data di awal request yang bukan bagian dari HTTP handshake, kirim ke SSH
+        # Tapi dalam kasus HTTP Custom, setelah 101 biasanya langsung masuk paket data murni
 
         def forward(src, dst):
             try:
@@ -69,7 +72,6 @@ debug = 4
 
 [ssh-ssl]
 accept = 0.0.0.0:$MAIN_PORT
-# Data yang masuk didekripsi dulu, lalu dilempar ke Python lokal untuk dicek payload WS-nya
 connect = 127.0.0.1:3333
 cert = /etc/stunnel/stunnel.pem
 EOF
