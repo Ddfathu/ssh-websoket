@@ -11,63 +11,41 @@ if ! id "$USER_NAME" &>/dev/null; then
 fi
 echo "$USER_NAME:$USER_PASS" | chpasswd
 
+echo "[*] Menginstall Dropbear & Nginx..."
+apt-get update && apt-get install -y dropbear nginx
+
 echo "[*] Memulai Dropbear di Port Lokal 222..."
-# Dropbear dipasang di port internal 222 biar kebal payload double HTTP abang
 dropbear -F -E -p 127.0.0.1:222 &
 
-echo "[*] Membangun Python Proxy dengan Teks Kustom Premium..."
-cat << 'EOF' > /usr/local/bin/premium-ws.py
-import socket, threading
+echo "[*] Mengonfigurasi Nginx Reverse Proxy..."
+# Nginx dikonfigurasi untuk menerima reverse-proxy dari Cloudflare & Railway tanpa memotong payload
+cat << 'EOF' > /etc/nginx/sites-available/default
+server {
+    listen 8888;
+    server_name _;
 
-def forward(src, dst):
-    try:
-        while True:
-            data = src.recv(8192)
-            if not data: break
-            dst.sendall(data)
-    except: pass
-    finally:
-        try: src.close()
-        except: pass
-        try: dst.close()
-        except: pass
-
-def handle(client):
-    try:
-        client.settimeout(5)
-        req = client.recv(8192)
-        if not req: return
+    location / {
+        proxy_pass http://127.0.0.1:222;
+        proxy_http_version 1.1;
         
-        backend = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        backend.connect(('127.0.0.1', 222))
+        # Teruskan semua header WebSocket utuh tanpa memodifikasi string
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
         
-        req_str = req.decode('utf-8', errors='ignore')
-        if "HTTP/" in req_str or "Upgrade:" in req_str:
-            # DI SINI KUNCINYA, BOS! Teks kustom dipasang langsung setelah status 101
-            custom_101 = b"HTTP/1.1 101 PT DDFATHU TUNNEL PREMIUM\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
-            client.sendall(custom_101)
-            
-            threading.Thread(target=forward, args=(client, backend), daemon=True).start()
-            forward(backend, client)
-        else:
-            # Jalur SNI Polosan murni
-            backend.sendall(req)
-            threading.Thread(target=forward, args=(client, backend), daemon=True).start()
-            forward(backend, client)
-    except: pass
-
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('127.0.0.1', 8888))
-s.listen(1000)
-while True:
-    try:
-        c, addr = s.accept()
-        threading.Thread(target=handle, args=(c,), daemon=True).start()
-    except: pass
+        # Buffer besar agar payload GET+PATCH abang tidak terpotong (Anti 400/520)
+        proxy_buffers 8 16k;
+        proxy_buffer_size 32k;
+        
+        # Timeout panjang agar tidak gampang disconnect
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}
 EOF
 
-python3 /usr/local/bin/premium-ws.py &
+echo "[*] Memulai Nginx..."
+service nginx start
 
 echo "[*] Membuat konfigurasi Stunnel Gateway..."
 cat <<EOF > /etc/stunnel/stunnel.conf
@@ -75,10 +53,11 @@ pid = /var/run/stunnel.pid
 foreground = yes
 debug = 4
 
-[ssh-premium]
+[ssh-nginx]
 accept = 0.0.0.0:$MAIN_PORT
 connect = 127.0.0.1:8888
 cert = /etc/stunnel/stunnel.pem
 EOF
 
+echo "[*] Memulai Stunnel Gateway..."
 exec stunnel /etc/stunnel/stunnel.conf
