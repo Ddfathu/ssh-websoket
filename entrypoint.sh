@@ -2,7 +2,9 @@
 
 USER_NAME="${SSH_USER:-ddfathu}"
 USER_PASS="${SSH_PASSWORD:-123456}"
-MAIN_PORT="${PORT:-8080}"
+MAIN_PORT="${PORT:-8080}" # Ini akan jadi port utama untuk SSL/TLS (SNI)
+WS_PORT="80"               # Port HTTP biasa untuk WebSocket (Tanpa SSL)
+SSH_PORT="22"
 
 echo "[*] Mengonfigurasi User SSH..."
 if ! id "$USER_NAME" &>/dev/null; then
@@ -11,29 +13,61 @@ if ! id "$USER_NAME" &>/dev/null; then
 fi
 echo "$USER_NAME:$USER_PASS" | chpasswd
 
-echo "[*] Memulai OpenSSH Server di Port 22..."
+echo "[*] Memulai OpenSSH Server di Port $SSH_PORT..."
 /usr/sbin/sshd
 
-echo "[*] Memulai Python Stream WebSocket Lokal di Port 3333..."
-cat << 'EOF' > /usr/local/bin/ws-server.py
-import socket
-import threading
+echo "[*] Menginstall & Menjalankan Python WebSocket Proxy..."
+# Script Python sederhana untuk handle WebSocket HTTP Upgrade ke SSH
+cat << 'EOF' > /usr/local/bin/ws-proxy.py
+import socket, sys, threading
 
-def forward(src, dst):
+def handle(client):
     try:
-        while True:
-            data = src.recv(4096)
-            if not data: 
-                break
-            dst.sendall(data)
-    except:
-        pass
-    finally:
-        src.close()
-        dst.close()
+        req = client.recv(1024).decode('utf-8', errors='ignore')
+        if "Upgrade: websocket" in req or "HTTP/1.1" in req:
+            client.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+            server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server.connect(('127.0.0.1', 22))
+            
+            def forward(src, dst):
+                try:
+                    while True:
+                        buf = src.recv(4096)
+                        if not buf: break
+                        dst.sendall(buf)
+                except: pass
+            
+            threading.Thread(target=forward, args=(client, server)).start()
+            forward(server, client)
+    except: pass
+    finally: client.close()
 
-def handle_client(client_socket):
-    try:
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.bind(('0.0.0.0', 8888)) # WS Proxy jalan internal di port 8888
+s.listen(100)
+while True:
+    c, addr = s.accept()
+    threading.Thread(target=handle, args=(c,)).start()
+EOF
+
+python3 /usr/local/bin/ws-proxy.py &
+
+echo "[*] Membuat konfigurasi Stunnel tunggal di Port $MAIN_PORT..."
+# Sekarang Stunnel di-connect ke WS Proxy (8888), bukan langsung ke SSH (22)
+# Jadi port $MAIN_PORT bisa buat SSH SNI + SSH WS TLS
+cat <<EOF > /etc/stunnel/stunnel.conf
+pid = /var/run/stunnel.pid
+foreground = yes
+debug = 4
+
+[ssh-websocket-ssl]
+accept = 0.0.0.0:$MAIN_PORT
+connect = 127.0.0.1:8888
+cert = /etc/stunnel/stunnel.pem
+EOF
+
+echo "[*] Memulai Stunnel..."
+exec stunnel /etc/stunnel/stunnel.conf
         # Hubungkan langsung ke OpenSSH lokal tanpa menahan buffer data (Anti-Lag / Anti-Freeze)
         ssh_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         ssh_socket.connect(('127.0.0.1', 22))
