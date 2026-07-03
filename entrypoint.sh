@@ -11,41 +11,44 @@ if ! id "$USER_NAME" &>/dev/null; then
 fi
 echo "$USER_NAME:$USER_PASS" | chpasswd
 
-echo "[*] Menginstall Dropbear & Nginx..."
-apt-get update && apt-get install -y dropbear nginx
+echo "[*] Menginstall Dropbear & HAProxy (Low-Level Multiplexer)..."
+apt-get update && apt-get install -y dropbear haproxy
 
-echo "[*] Memulai Dropbear di Port Lokal 222..."
+echo "[*] Memulai Dropbear pada Port Lokal 222..."
+# Dropbear dijalankan tanpa banner agar hemat buffer data
 dropbear -F -E -p 127.0.0.1:222 &
 
-echo "[*] Mengonfigurasi Nginx Reverse Proxy..."
-# Nginx dikonfigurasi untuk menerima reverse-proxy dari Cloudflare & Railway tanpa memotong payload
-cat << 'EOF' > /etc/nginx/sites-available/default
-server {
-    listen 8888;
-    server_name _;
+echo "[*] Mengonfigurasi HAProxy Pure TCP Pipelining..."
+# HAProxy diatur pada mode tcp (Layer 4) agar kebal terhadap payload HTTP yang ditumpuk-tumpuk
+cat << 'EOF' > /etc/haproxy/haproxy.cfg
+global
+    log /dev/log local0
 
-    location / {
-        proxy_pass http://127.0.0.1:222;
-        proxy_http_version 1.1;
-        
-        # Teruskan semua header WebSocket utuh tanpa memodifikasi string
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        
-        # Buffer besar agar payload GET+PATCH abang tidak terpotong (Anti 400/520)
-        proxy_buffers 8 16k;
-        proxy_buffer_size 32k;
-        
-        # Timeout panjang agar tidak gampang disconnect
-        proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
-    }
-}
+defaults
+    log     global
+    mode    tcp
+    timeout connect 5s
+    timeout client  50s
+    timeout server  50s
+
+frontend ssl_and_ws_front
+    bind 127.0.0.1:8888
+    mode tcp
+    # Inspeksi byte awal: jika ada indikasi HTTP request atau payload WebSocket, 
+    # langsung oper ke backend ws tanpa membaca isi text-nya secara detail.
+    tcp-request inspect-delay 5s
+    tcp-request content accept if HTTP
+    
+    default_backend dropbear_backend
+
+backend dropbear_backend
+    mode tcp
+    # Salurkan seluruh data mentah (termasuk paket GET + PATCH) secara utuh langsung ke Dropbear
+    server ssh_srv 127.0.0.1:222 maxconn 1000
 EOF
 
-echo "[*] Memulai Nginx..."
-service nginx start
+echo "[*] Memulai HAProxy..."
+haproxy -f /etc/haproxy/haproxy.cfg &
 
 echo "[*] Membuat konfigurasi Stunnel Gateway..."
 cat <<EOF > /etc/stunnel/stunnel.conf
@@ -53,11 +56,11 @@ pid = /var/run/stunnel.pid
 foreground = yes
 debug = 4
 
-[ssh-nginx]
+[ssh-haproxy-gateway]
 accept = 0.0.0.0:$MAIN_PORT
 connect = 127.0.0.1:8888
 cert = /etc/stunnel/stunnel.pem
 EOF
 
-echo "[*] Memulai Stunnel Gateway..."
+echo "[*] Memulai Stunnel Multiplexer..."
 exec stunnel /etc/stunnel/stunnel.conf
